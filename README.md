@@ -13,9 +13,10 @@
 
 1. 登录 Cloudflare 控制台
 2. 进入 Workers & Pages
-3. 选择你的 Worker
-4. 点击 "Triggers" 标签
+3. 新建 Worker
+4. 复制本项目的 worker.js 代码到 Worker后保存
 5. 添加自定义域名（需要域名已托管在 Cloudflare）
+6. 访问你的 Worker 域名
 
 ## 🎯 使用方法
 
