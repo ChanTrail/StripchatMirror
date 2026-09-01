@@ -2,7 +2,7 @@
 
 [简体中文](README.md) | [English](README.en.md)
 
-A Cloudflare Workers reverse-proxy example that forwards requests to stripchat.com and related domains through a single entry point, with response rewriting.
+A Cloudflare Workers reverse-proxy example that forwards requests to stripchat.com and related domains through a single entry point, with response rewriting. This repository keeps only the core proxy capability, without an admin dashboard, load balancing, or other extras.
 
 ---
 
@@ -61,6 +61,7 @@ High-level flow:
 2. Worker routes by path and headers:
    - OPTIONS: return CORS preflight response directly.
    - /\_csp or csp-report: return 204.
+   - /cdn-cgi/\*: passthrough to the target site for Cloudflare Bot challenge callbacks (redirects are not followed; original status code and Set-Cookie are preserved).
    - Upgrade: websocket: route to WebSocket forwarding.
    - Other requests: route to HTTP proxy pipeline.
 3. Worker builds upstream request and executes fetch.

@@ -2,7 +2,7 @@
 
 [简体中文](README.md) | [English](README.en.md)
 
-基于 Cloudflare Workers 的反向代理示例，用于将 stripchat.com 及其关联资源通过单一入口进行转发与响应重写。
+基于 Cloudflare Workers 的反向代理示例，用于将 stripchat.com 及其关联资源通过单一入口进行转发与响应重写。本仓库只保留核心代理能力，不包含管理后台、负载均衡等附加功能。
 
 ---
 
@@ -25,7 +25,7 @@
 
 ## 项目概述
 
-该 Worker 实现了一个“受控目标域名”的反向代理，主要目标是：
+该 Cloudflare Worker 实现了一个“受控目标域名”的反向代理，主要目标是：
 
 1. 代理页面与静态资源请求。
 2. 处理跨域访问与预检请求（CORS）。
@@ -61,6 +61,7 @@
 2. Worker 根据路径与请求头做分流：
    - OPTIONS：直接返回 CORS 预检响应。
    - /\_csp 或 csp-report：返回 204。
+   - /cdn-cgi/\*：透传给目标站点，用于 Cloudflare Bot 挑战回调（不跟随重定向，保留原始状态码与 Set-Cookie）。
    - Upgrade: websocket：走 WebSocket 转发逻辑。
    - 其他请求：进入 HTTP 代理链路。
 3. Worker 构建上游请求并发起 fetch。
