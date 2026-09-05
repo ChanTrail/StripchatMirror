@@ -47,8 +47,21 @@ async function handleRequest(request) {
 		return handleCORS();
 	}
 
+	// ── 忽略 CSP 报告 ────────────────────────────────────────────────────────
 	if (url.pathname === "/_csp" || url.pathname.includes("csp-report")) {
 		return new Response(null, { status: 204 });
+	}
+
+	// ── adblock 检测诱饵：返回空 JS，让前端认为脚本加载成功 ──────────────────
+	if (url.pathname === "/_proxy_noop.js") {
+		return new Response("", {
+			status: 200,
+			headers: {
+				"Content-Type": "application/javascript; charset=utf-8",
+				"Cache-Control": "public, max-age=3600",
+				"Access-Control-Allow-Origin": "*",
+			},
+		});
 	}
 
 	if (url.pathname.startsWith("/cdn-cgi/")) {
@@ -265,13 +278,13 @@ async function processResponse(response, proxyUrl, originalRequest) {
 
 			if (contentType.includes("text/html")) {
 				text = text.replace(/<meta[^>]*http-equiv=["']Content-Security-Policy["'][^>]*>/gi, "");
-				text = text.replace(/<script[^>]*cloudflareinsights\.com[^>]*>[\s\S]*?<\/script>/gi, "<!-- CF blocked -->");
-				text = text.replace(/<script[^>]*cloudflareinsights\.com[^>]*\/>/gi, "<!-- CF blocked -->");
+
+				// 不屏蔽 cloudflareinsights / beacon 脚本（adblock 检测诱饵），改为重定向到 noop
 				text = text.replace(
-					/<script([^>]*)src=(["'])[^"']*cloudflareinsights\.com[^"']*\2([^>]*)>[\s\S]*?<\/script>/gi,
-					"<!-- CF blocked -->",
+					/(src=)(["'])https?:\/\/[^"']*cloudflareinsights\.com[^"']*(["'])/gi,
+					"$1$2/_proxy_noop.js$3",
 				);
-				text = text.replace(/<script[^>]*beacon\.min\.js[^>]*>[\s\S]*?<\/script>/gi, "<!-- Beacon blocked -->");
+
 				text = text.replace(/<script([^>]*)\s+integrity=(["'])[^"']*\2([^>]*)>/gi, "<script$1$3>");
 				text = text.replace(/<script([^>]*)\s+crossorigin=(["'])[^"']*\2([^>]*)>/gi, "<script$1$3>");
 				text = text.replace(/<link([^>]*)\s+integrity=(["'])[^"']*\2([^>]*)>/gi, "<link$1$3>");
@@ -308,7 +321,8 @@ function buildProxyScript(proxyUrl) {
   var O = ${JSON.stringify(origin)};
   var H = ${JSON.stringify(host)};
   var WP = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  var blockedDomains = ['cloudflareinsights.com','googletagmanager.com','beacon.min.js'];
+  var blockedDomains = ['googletagmanager.com'];
+  var noopDomains = ['cloudflareinsights.com','beacon.min.js'];
 
   // 0. 伪造 __cf_chl_opt，防止前端检测"未通过 CF Bot 挑战"后渲染错误页
   try { if(!window.__cf_chl_opt) window.__cf_chl_opt = {}; } catch(e){}
@@ -344,6 +358,12 @@ function buildProxyScript(proxyUrl) {
       if(el && el.tagName==='SCRIPT'){
         var s=el.src||el.getAttribute('src')||'';
         if(blockedDomains.some(function(d){return s.indexOf(d)>=0;})) return true;
+        if(noopDomains.some(function(d){return s.indexOf(d)>=0;})){
+          el.src = '/_proxy_noop.js';
+          el.removeAttribute('integrity');
+          el.removeAttribute('crossorigin');
+          return false;
+        }
         el.removeAttribute('integrity');
         el.removeAttribute('crossorigin');
       }

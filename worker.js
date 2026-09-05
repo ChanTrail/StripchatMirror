@@ -50,6 +50,21 @@ async function handleRequest(request) {
 		return new Response(null, { status: 204 });
 	}
 
+	// ── adblock 检测诱饵：返回空 JS，让前端认为脚本加载成功 ──────────────────
+	// stripchat 通过检测 cloudflareinsights 等脚本能否加载来判断是否被广告拦截，
+	// 如果脚本被屏蔽则渲染 "Something's Not Loading Right" 错误页。
+	// 代理把这类脚本的 src 重定向到 /_proxy_noop.js，返回合法的空 JS 响应。
+	if (url.pathname === "/_proxy_noop.js") {
+		return new Response("", {
+			status: 200,
+			headers: {
+				"Content-Type": "application/javascript; charset=utf-8",
+				"Cache-Control": "public, max-age=3600",
+				"Access-Control-Allow-Origin": "*",
+			},
+		});
+	}
+
 	// ── /cdn-cgi/ 路由：CF Bot 挑战回调透传 ──────────────────────────────────
 	// 挑战 JS 提交 token 时目标是真实域名，必须直连；只清除 cookie 限制
 	if (url.pathname.startsWith("/cdn-cgi/")) {
@@ -286,11 +301,15 @@ async function processResponse(response, proxyUrl, originalRequest) {
 				// 移除 CSP meta 标签
 				text = text.replace(/<meta[^>]*http-equiv=["']Content-Security-Policy["'][^>]*>/gi, "");
 
-				// 屏蔽 Cloudflare Insights / beacon
-				text = text.replace(/<script[^>]*cloudflareinsights\.com[^>]*>[\s\S]*?<\/script>/gi, "<!-- CF blocked -->");
-				text = text.replace(/<script[^>]*cloudflareinsights\.com[^>]*\/>/gi, "<!-- CF blocked -->");
-				text = text.replace(/<script([^>]*)src=(["'])[^"']*cloudflareinsights\.com[^"']*\2([^>]*)>[\s\S]*?<\/script>/gi, "<!-- CF blocked -->");
-				text = text.replace(/<script[^>]*beacon\.min\.js[^>]*>[\s\S]*?<\/script>/gi, "<!-- Beacon blocked -->");
+				// 不屏蔽 cloudflareinsights / beacon 脚本：
+				// stripchat 使用这类脚本作为广告拦截检测的"诱饵"——
+				// 如果脚本被屏蔽，前端会渲染 "Something's Not Loading Right" 错误页。
+				// 正确做法是让脚本请求打到代理域名下，由 /cdn-cgi/bm/* 路由或直接返回空响应。
+				// 只替换 src 里的外部域名，让请求走代理路径。
+				text = text.replace(
+					/(src=)(["'])https?:\/\/[^"']*cloudflareinsights\.com[^"']*(["'])/gi,
+					"$1$2/_proxy_noop.js$3",
+				);
 
 				// 移除 integrity / crossorigin 属性
 				text = text.replace(/<script([^>]*)\s+integrity=(["'])[^"']*\2([^>]*)>/gi, "<script$1$3>");
@@ -330,7 +349,10 @@ function buildProxyScript(proxyUrl) {
   var O = ${JSON.stringify(origin)};
   var H = ${JSON.stringify(host)};
   var WP = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  var blockedDomains = ['cloudflareinsights.com','googletagmanager.com','beacon.min.js'];
+  var blockedDomains = ['googletagmanager.com'];
+  // cloudflareinsights / beacon 不再屏蔽，改为重定向到空响应，
+  // 防止 stripchat adblock 检测误判触发错误页
+  var noopDomains = ['cloudflareinsights.com','beacon.min.js'];
 
   // 0. 伪造 __cf_chl_opt，防止前端检测"未通过 CF Bot 挑战"后渲染错误页
   try { if(!window.__cf_chl_opt) window.__cf_chl_opt = {}; } catch(e){}
@@ -366,6 +388,13 @@ function buildProxyScript(proxyUrl) {
       if(el && el.tagName==='SCRIPT'){
         var s=el.src||el.getAttribute('src')||'';
         if(blockedDomains.some(function(d){return s.indexOf(d)>=0;})) return true;
+        // cloudflareinsights 等诱饵脚本重定向到空 noop，让检测通过
+        if(noopDomains.some(function(d){return s.indexOf(d)>=0;})){
+          el.src = '/_proxy_noop.js';
+          el.removeAttribute('integrity');
+          el.removeAttribute('crossorigin');
+          return false; // 不拦截，让它加载 noop
+        }
         el.removeAttribute('integrity');
         el.removeAttribute('crossorigin');
       }
