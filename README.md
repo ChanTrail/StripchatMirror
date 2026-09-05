@@ -12,7 +12,7 @@
 - [核心能力](#核心能力)
 - [架构与请求流程](#架构与请求流程)
 - [仓库结构](#仓库结构)
-- [快速开始](#快速开始)
+- [快速开始（Cloudflare / Vercel）](#快速开始)
 - [配置说明](#配置说明)
 - [运行与运维建议](#运行与运维建议)
 - [故障排查](#故障排查)
@@ -78,10 +78,14 @@
 
 ```text
 .
+├── api/
+│   └── index.js       # Vercel Edge Function 入口
 ├── LICENSE
 ├── README.md
 ├── README.en.md
-└── worker.js
+├── package.json
+├── vercel.json
+└── worker.js          # Cloudflare Workers 入口
 ```
 
 ---
@@ -102,6 +106,52 @@
 4. 用仓库中的 worker.js 覆盖默认代码并保存。
 5. 点击 Deploy。
 6. 通过 \*.workers.dev 或绑定域名访问。
+
+### 方式三：Vercel 部署
+
+#### 前置条件
+
+1. 已注册 [Vercel](https://vercel.com) 账号。
+2. 已安装 Node.js（16+）。
+
+#### 方式 A：通过 Vercel 控制台（推荐）
+
+1. 将本仓库 Fork 或导入到你的 GitHub/GitLab/Bitbucket 账号。
+2. 登录 Vercel 控制台，点击 **Add New → Project**，选择该仓库。
+3. 框架预设选 **Other**，其他保持默认，点击 **Deploy**。
+4. 部署完成后通过分配的 `*.vercel.app` 域名或自定义域名访问。
+
+> 每次推送到主分支，Vercel 会自动触发重新部署。
+
+#### 方式 B：Vercel CLI 部署
+
+```bash
+npm install -g vercel
+vercel login
+vercel --prod
+```
+
+#### 本地调试
+
+```bash
+npm install
+npm run dev
+# 等同于 vercel dev，在 http://localhost:3000 启动本地预览
+```
+
+#### Vercel 与 Cloudflare Workers 的差异说明
+
+| 能力 | Cloudflare Workers | Vercel Edge Function |
+|---|---|---|
+| 运行时 | V8 isolate | V8 isolate（Edge Runtime） |
+| WebSocket 双向代理 | ✅ 原生支持 | ⚠️ 不支持双向 WS，仅透传升级头 |
+| 免费额度 | 10 万次/天 | 100 万次/月 |
+| 冷启动 | 极低（~1ms） | 极低（~5ms） |
+| 全球节点 | ~300 个 | ~100 个 |
+
+> 如需完整 WebSocket 支持，建议使用 Cloudflare Workers（`worker.js`）。
+
+---
 
 ### 方式二：Wrangler CLI 部署
 
