@@ -14,19 +14,43 @@ const TARGET_DOMAIN = "stripchat.com";
 const TARGET_URL    = `https://${TARGET_DOMAIN}`;
 
 // ─── 需要代理的相关域名 ─────────────────────────────────────────────────────────
-// 用正则匹配所有 *.stripchat.com 子域，同时保留固定的 CDN 域名
-const STRIPCHAT_SUBDOMAIN_RE = /[a-z0-9-]+\.stripchat\.com/gi;
+// 用正则匹配所有 *.stripchat.com / *.chantrail.com 子域
+const STRIPCHAT_SUBDOMAIN_RE = /[a-z0-9-]+\.(?:stripchat|chantrail)\.com/gi;
+
+// ─── 外部域名路由表：域名 → 上游 origin ───────────────────────────────────────
+// 浏览器请求代理域名时，根据 Referer / 已知路径前缀把请求转发到对应上游
+const EXTERNAL_DOMAIN_MAP = {
+	"assets.chapturist.com":    "https://assets.chapturist.com",
+	"assets.strpssts-ana.com":  "https://assets.strpssts-ana.com",
+	"img.strpst.com":           "https://img.strpst.com",
+	"static.stripst.com":       "https://static.stripst.com",
+	"b-eu-ams.stripst.com":     "https://b-eu-ams.stripst.com",
+	"b-eu.stripst.com":         "https://b-eu.stripst.com",
+	"edge-hls.doppiocdn.com":   "https://edge-hls.doppiocdn.com",
+};
 
 const PROXY_DOMAINS = [
+	// ── stripchat.com 主域及子域 ──────────────────────────────────
 	"stripchat.com",
 	"www.stripchat.com",
 	"zh.stripchat.com",
-	"b-eu-ams.stripst.com",
-	"b-eu.stripst.com",
+	// ── chapturist.com（所有静态资源/JS bundle）────────────────────
+	"assets.chapturist.com",
+	// ── stripchat 其他静态/CDN 域 ─────────────────────────────────
 	"img.strpst.com",
 	"static.stripst.com",
-	"websocket-sp-v6.stripchat.com",
+	"assets.strpssts-ana.com",
+	// ── stripst.com CDN ───────────────────────────────────────────
+	"b-eu-ams.stripst.com",
+	"b-eu.stripst.com",
+	// ── chantrail.com（CF 代理域，含 RUM / WS / CDN）─────────────
+	"sc1.chantrail.com",
+	"st.chantrail.com",
 	"websocket-sp-v6.st.chantrail.com",
+	// ── HLS 流媒体 ─────────────────────────────────────────────────
+	"edge-hls.doppiocdn.com",
+	// ── WebSocket ────────────────────────────────────────────────
+	"websocket-sp-v6.stripchat.com",
 ];
 
 // ─── Worker 入口（ES Module 模式）───────────────────────────────────────────────
@@ -63,6 +87,17 @@ async function handleRequest(request) {
 				"Access-Control-Allow-Origin": "*",
 			},
 		});
+	}
+
+	// ── 外部域名路由：根据 Referer 判断请求归属哪个上游域名 ─────────────────
+	// 场景：HTML 里 assets.chapturist.com 的 URL 已被替换成代理域名，
+	// 浏览器请求 /assets/bootstrap.xxx.js 时 Referer 是代理域名，
+	// 需要根据路径前缀推断真正的上游并转发。
+	const externalTarget = resolveExternalTarget(url, request.headers.get("Referer") || "");
+	if (externalTarget) {
+		const extUrl = new URL(url.pathname + url.search + url.hash, externalTarget);
+		const extResp = await fetch(buildProxyRequest(request, extUrl));
+		return processResponse(extResp, url, request);
 	}
 
 	// ── /cdn-cgi/ 路由：CF Bot 挑战回调透传 ──────────────────────────────────
@@ -271,18 +306,18 @@ async function processResponse(response, proxyUrl, originalRequest) {
 				text = text.replace(new RegExp(`//${esc}`, "gi"), `//${proxyUrl.host}`);
 			}
 
-			// URL 重写：*.stripchat.com 所有子域（捕获挑战脚本里硬编码的 zh.stripchat.com 等）
+			// URL 重写：*.stripchat.com / *.chantrail.com / *.chapturist.com 所有子域
 			text = text.replace(
-				/https?:\/\/([a-z0-9-]+\.stripchat\.com)/gi,
+				/https?:\/\/([a-z0-9-]+\.(?:stripchat|chantrail|chapturist)\.com)/gi,
 				proxyUrl.origin,
 			);
 			text = text.replace(
-				/\/\/([a-z0-9-]+\.stripchat\.com)/gi,
+				/\/\/([a-z0-9-]+\.(?:stripchat|chantrail|chapturist)\.com)/gi,
 				`//${proxyUrl.host}`,
 			);
 
-			// WebSocket URL 重写（所有 *.stripchat.com 子域）
-			text = text.replace(/wss?:\/\/([a-z0-9-]+\.stripchat\.com)/gi, (match) => {
+			// WebSocket URL 重写（所有相关子域）
+			text = text.replace(/wss?:\/\/([a-z0-9-]+\.(?:stripchat|chantrail|chapturist)\.com)/gi, () => {
 				const wsProto = proxyUrl.protocol === "https:" ? "wss:" : "ws:";
 				return `${wsProto}//${proxyUrl.host}`;
 			});
@@ -407,9 +442,9 @@ function buildProxyScript(proxyUrl) {
   } catch(e){}
 
   // 3. URL 重写工具函数
-  //    覆盖所有需要代理的域：*.stripchat.com、*.stripst.com、*.chantrail.com、*.strpst.com
-  var PROXY_RE = /https?:\\/\\/(?:[a-z0-9-]+\\.)?(?:stripchat\\.com|stripst\\.com|chantrail\\.com|strpst\\.com)/gi;
-  var WS_RE    = /wss?:\\/\\/(?:[a-z0-9-]+\\.)?(?:stripchat\\.com|stripst\\.com|chantrail\\.com|strpst\\.com)/gi;
+  //    覆盖所有需要代理的域：*.stripchat.com、*.stripst.com、*.chantrail.com、*.strpst.com、*.chapturist.com
+  var PROXY_RE = /https?:\\/\\/(?:[a-z0-9-]+\\.)?(?:stripchat\\.com|stripst\\.com|chantrail\\.com|strpst\\.com|chapturist\\.com)/gi;
+  var WS_RE    = /wss?:\\/\\/(?:[a-z0-9-]+\\.)?(?:stripchat\\.com|stripst\\.com|chantrail\\.com|strpst\\.com|chapturist\\.com)/gi;
   function _rw(u){
     if(typeof u!=='string') return u;
     return u.replace(PROXY_RE, O);
@@ -486,6 +521,26 @@ function buildProxyScript(proxyUrl) {
   } catch(e){}
 })();
 </script>`;
+}
+
+// ─── 外部域名路由解析 ───────────────────────────────────────────────────────────
+// 判断当前请求是否应该转发到非 stripchat.com 的上游域名。
+// 策略：
+//  1. 路径以 /assets/ 开头 → chapturist.com（JS bundle / CSS / 图片）
+//  2. 路径以 /pixel/ 开头 → stripchat.com（adblock 像素上报，保持默认）
+//  3. 路径以 /hls/ 开头   → edge-hls.doppiocdn.com（HLS 流）
+// 返回完整 origin 字符串，或 null（走默认 stripchat.com 路由）
+function resolveExternalTarget(url, referer) {
+	const p = url.pathname;
+	// JS / CSS / 字体 / 图片等静态资源
+	if (p.startsWith("/assets/")) {
+		return "https://assets.chapturist.com";
+	}
+	// HLS 流媒体分片
+	if (p.startsWith("/hls/") || p.startsWith("/edge-hls/")) {
+		return "https://edge-hls.doppiocdn.com";
+	}
+	return null;
 }
 
 // ─── CORS 预检 ──────────────────────────────────────────────────────────────────

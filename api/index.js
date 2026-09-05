@@ -20,18 +20,35 @@ const TARGET_DOMAIN = "stripchat.com";
 const TARGET_URL    = `https://${TARGET_DOMAIN}`;
 
 // ─── 需要代理的相关域名 ─────────────────────────────────────────────────────────
-const STRIPCHAT_SUBDOMAIN_RE = /[a-z0-9-]+\.stripchat\.com/gi;
+// 用正则匹配所有 *.stripchat.com / *.chantrail.com 子域
+const STRIPCHAT_SUBDOMAIN_RE = /[a-z0-9-]+\.(?:stripchat|chantrail)\.com/gi;
+
+// ─── 外部域名路由表：域名 → 上游 origin ───────────────────────────────────────
+const EXTERNAL_DOMAIN_MAP = {
+	"assets.chapturist.com":    "https://assets.chapturist.com",
+	"assets.strpssts-ana.com":  "https://assets.strpssts-ana.com",
+	"img.strpst.com":           "https://img.strpst.com",
+	"static.stripst.com":       "https://static.stripst.com",
+	"b-eu-ams.stripst.com":     "https://b-eu-ams.stripst.com",
+	"b-eu.stripst.com":         "https://b-eu.stripst.com",
+	"edge-hls.doppiocdn.com":   "https://edge-hls.doppiocdn.com",
+};
 
 const PROXY_DOMAINS = [
 	"stripchat.com",
 	"www.stripchat.com",
 	"zh.stripchat.com",
-	"b-eu-ams.stripst.com",
-	"b-eu.stripst.com",
+	"assets.chapturist.com",
 	"img.strpst.com",
 	"static.stripst.com",
-	"websocket-sp-v6.stripchat.com",
+	"assets.strpssts-ana.com",
+	"b-eu-ams.stripst.com",
+	"b-eu.stripst.com",
+	"sc1.chantrail.com",
+	"st.chantrail.com",
 	"websocket-sp-v6.st.chantrail.com",
+	"edge-hls.doppiocdn.com",
+	"websocket-sp-v6.stripchat.com",
 ];
 
 // ─── Vercel Edge Function 入口 ──────────────────────────────────────────────────
@@ -66,6 +83,14 @@ async function handleRequest(request) {
 
 	if (url.pathname.startsWith("/cdn-cgi/")) {
 		return proxyChallenge(request, url);
+	}
+
+	// ── 外部域名路由 ──────────────────────────────────────────────────────────
+	const externalTarget = resolveExternalTarget(url, request.headers.get("Referer") || "");
+	if (externalTarget) {
+		const extUrl = new URL(url.pathname + url.search + url.hash, externalTarget);
+		const extResp = await fetch(buildProxyRequest(request, extUrl));
+		return processResponse(extResp, url, request);
 	}
 
 	// WebSocket：Edge Runtime 不支持双向 WS，此处仅做透传尝试
@@ -259,10 +284,10 @@ async function processResponse(response, proxyUrl, originalRequest) {
 				text = text.replace(new RegExp(`//${esc}`, "gi"), `//${proxyUrl.host}`);
 			}
 
-			text = text.replace(/https?:\/\/([a-z0-9-]+\.stripchat\.com)/gi, proxyUrl.origin);
-			text = text.replace(/\/\/([a-z0-9-]+\.stripchat\.com)/gi, `//${proxyUrl.host}`);
+			text = text.replace(/https?:\/\/([a-z0-9-]+\.(?:stripchat|chantrail|chapturist)\.com)/gi, proxyUrl.origin);
+			text = text.replace(/\/\/([a-z0-9-]+\.(?:stripchat|chantrail|chapturist)\.com)/gi, `//${proxyUrl.host}`);
 
-			text = text.replace(/wss?:\/\/([a-z0-9-]+\.stripchat\.com)/gi, () => {
+			text = text.replace(/wss?:\/\/([a-z0-9-]+\.(?:stripchat|chantrail|chapturist)\.com)/gi, () => {
 				const wsProto = proxyUrl.protocol === "https:" ? "wss:" : "ws:";
 				return `${wsProto}//${proxyUrl.host}`;
 			});
@@ -376,9 +401,9 @@ function buildProxyScript(proxyUrl) {
   } catch(e){}
 
   // 3. URL 重写工具函数
-  //    覆盖所有需要代理的域：*.stripchat.com、*.stripst.com、*.chantrail.com、*.strpst.com
-  var PROXY_RE = /https?:\\/\\/(?:[a-z0-9-]+\\.)?(?:stripchat\\.com|stripst\\.com|chantrail\\.com|strpst\\.com)/gi;
-  var WS_RE    = /wss?:\\/\\/(?:[a-z0-9-]+\\.)?(?:stripchat\\.com|stripst\\.com|chantrail\\.com|strpst\\.com)/gi;
+  //    覆盖所有需要代理的域：*.stripchat.com、*.stripst.com、*.chantrail.com、*.strpst.com、*.chapturist.com
+  var PROXY_RE = /https?:\\/\\/(?:[a-z0-9-]+\\.)?(?:stripchat\\.com|stripst\\.com|chantrail\\.com|strpst\\.com|chapturist\\.com)/gi;
+  var WS_RE    = /wss?:\\/\\/(?:[a-z0-9-]+\\.)?(?:stripchat\\.com|stripst\\.com|chantrail\\.com|strpst\\.com|chapturist\\.com)/gi;
   function _rw(u){
     if(typeof u!=='string') return u;
     return u.replace(PROXY_RE, O);
@@ -469,4 +494,16 @@ function handleCORS() {
 			"Access-Control-Max-Age": "86400",
 		},
 	});
+}
+
+// ─── 外部域名路由解析 ───────────────────────────────────────────────────────────
+function resolveExternalTarget(url, referer) {
+	const p = url.pathname;
+	if (p.startsWith("/assets/")) {
+		return "https://assets.chapturist.com";
+	}
+	if (p.startsWith("/hls/") || p.startsWith("/edge-hls/")) {
+		return "https://edge-hls.doppiocdn.com";
+	}
+	return null;
 }
