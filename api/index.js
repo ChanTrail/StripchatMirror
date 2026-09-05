@@ -165,7 +165,8 @@ function buildProxyRequest(originalRequest, targetUrl) {
 
 	[
 		"cf-connecting-ip", "cf-ipcountry", "cf-ray", "cf-visitor",
-		"x-forwarded-for", "x-forwarded-proto", "x-real-ip", "cf-worker", "cdn-loop",
+		"x-forwarded-for", "x-forwarded-proto", "x-forwarded-host",
+		"x-real-ip", "cf-worker", "cdn-loop",
 	].forEach((h) => headers.delete(h));
 
 	const requestInit = {
@@ -210,17 +211,18 @@ async function processResponse(response, proxyUrl, originalRequest) {
 	newHeaders.set("Access-Control-Allow-Headers", "*");
 	newHeaders.set("Access-Control-Expose-Headers", "*");
 
+	// 处理 Set-Cookie：
+	//   - 清除 Domain 限制，避免 cookie 绑定原始域
+	//   - 所有 cookie 统一改为 SameSite=None; Secure
+	//     原因：代理场景下页面与 API 请求均为跨站，SameSite=Lax 会导致
+	//     XHR/fetch 发起的请求不携带 session cookie，服务端认为未登录
 	for (const [key, value] of response.headers.entries()) {
 		if (key.toLowerCase() === "set-cookie") {
 			let c = value.replace(/;\s*Domain=[^;]+/gi, "");
-			const isCfClearance = /^cf_clearance=/i.test(c.trim());
-			if (isCfClearance) {
-				c = c.replace(/;\s*SameSite=[^;]+/gi, "");
-				c += "; SameSite=None; Secure";
-			} else {
-				c = c.replace(/;\s*Secure\b/gi, "").replace(/;\s*SameSite=[^;]+/gi, "");
-				c += "; SameSite=Lax";
-			}
+			// 统一设置 SameSite=None; Secure，保证跨站请求携带 cookie
+			c = c.replace(/;\s*SameSite=[^;]+/gi, "");
+			if (!/;\s*Secure\b/i.test(c)) c += "; Secure";
+			c += "; SameSite=None";
 			if (!c.toLowerCase().includes("path=")) c += "; Path=/";
 			newHeaders.append("Set-Cookie", c);
 		}
@@ -308,6 +310,12 @@ function buildProxyScript(proxyUrl) {
   var WP = location.protocol === 'https:' ? 'wss:' : 'ws:';
   var blockedDomains = ['cloudflareinsights.com','googletagmanager.com','beacon.min.js'];
 
+  // 0. 伪造 __cf_chl_opt，防止前端检测"未通过 CF Bot 挑战"后渲染错误页
+  try { if(!window.__cf_chl_opt) window.__cf_chl_opt = {}; } catch(e){}
+
+  // 1. Cookie 修复
+  //    - 去除 Domain 绑定，使 cookie 在代理域下生效
+  //    - 保留 SameSite=None（跨站 API 请求必须携带），不再错误地将其删除
   try {
     var desc = Object.getOwnPropertyDescriptor(Document.prototype,'cookie') ||
                Object.getOwnPropertyDescriptor(HTMLDocument.prototype,'cookie');
@@ -316,8 +324,9 @@ function buildProxyScript(proxyUrl) {
         get: function(){ return desc.get.call(document); },
         set: function(v){
           v = v.replace(/;\\s*[Dd]omain=[^;]+/g,'');
-          if(location.protocol!=='https:') v=v.replace(/;\\s*[Ss]ecure/g,'');
-          v = v.replace(/;\\s*[Ss]ameSite=None/g,'');
+          // HTTP 环境下去掉 Secure 标志，避免 cookie 无法写入
+          if(location.protocol!=='https:') v=v.replace(/;\\s*[Ss]ecure\\b/g,'');
+          // 不再删除 SameSite=None，跨站 fetch/XHR 需要它来携带 cookie
           return desc.set.call(document,v);
         },
         configurable:true
@@ -325,9 +334,12 @@ function buildProxyScript(proxyUrl) {
     }
   } catch(e){}
 
+  // 2. 脚本注入拦截（appendChild / insertBefore / prepend / after）
   try {
     var _ac = Element.prototype.appendChild;
     var _ib = Element.prototype.insertBefore;
+    var _pr = Element.prototype.prepend;
+    var _af = Element.prototype.after;
     function chk(el){
       if(el && el.tagName==='SCRIPT'){
         var s=el.src||el.getAttribute('src')||'';
@@ -337,13 +349,28 @@ function buildProxyScript(proxyUrl) {
       }
       return false;
     }
-    Element.prototype.appendChild=function(el){ return chk(el)?el:_ac.call(this,el); };
-    Element.prototype.insertBefore=function(n,r){ return chk(n)?n:_ib.call(this,n,r); };
+    Element.prototype.appendChild  = function(el){ return chk(el)?el:_ac.call(this,el); };
+    Element.prototype.insertBefore = function(n,r){ return chk(n)?n:_ib.call(this,n,r); };
+    if(_pr) Element.prototype.prepend = function(){ var a=Array.prototype.slice.call(arguments); a.forEach(function(n){ chk(n); }); return _pr.apply(this,a); };
+    if(_af) Element.prototype.after  = function(){ var a=Array.prototype.slice.call(arguments); a.forEach(function(n){ chk(n); }); return _af.apply(this,a); };
   } catch(e){}
 
+  // 3. URL 重写工具函数
+  //    覆盖所有需要代理的域：*.stripchat.com、*.stripst.com、*.chantrail.com、*.strpst.com
+  var PROXY_RE = /https?:\\/\\/(?:[a-z0-9-]+\\.)?(?:stripchat\\.com|stripst\\.com|chantrail\\.com|strpst\\.com)/gi;
+  var WS_RE    = /wss?:\\/\\/(?:[a-z0-9-]+\\.)?(?:stripchat\\.com|stripst\\.com|chantrail\\.com|strpst\\.com)/gi;
+  function _rw(u){
+    if(typeof u!=='string') return u;
+    return u.replace(PROXY_RE, O);
+  }
+  function _rwWS(u){
+    if(typeof u!=='string') return u;
+    return u.replace(WS_RE, WP+'//'+H);
+  }
+
+  // 4. fetch 重写
   try {
     var _f = window.fetch;
-    function _rw(u){ return typeof u==='string'?u.replace(/https?:\\/\\/[a-z0-9-]+\\.stripchat\\.com/gi,O):u; }
     window.fetch = function(input, init) {
       if(typeof input==='string'){
         input = _rw(input);
@@ -356,24 +383,54 @@ function buildProxyScript(proxyUrl) {
     };
   } catch(e){}
 
+  // 5. sendBeacon 重写（统计上报跨域）
+  try {
+    var _sb = navigator.sendBeacon.bind(navigator);
+    navigator.sendBeacon = function(url, data){
+      return _sb(_rw(url), data);
+    };
+  } catch(e){}
+
+  // 6. XHR 重写
   try {
     var _o = XMLHttpRequest.prototype.open;
     XMLHttpRequest.prototype.open = function(m,u){
-      if(typeof u==='string') u=u.replace(/https?:\\/\\/[a-z0-9-]+\\.stripchat\\.com/gi,O);
+      if(typeof u==='string') u=_rw(u);
       return _o.apply(this,[m,u].concat(Array.prototype.slice.call(arguments,2)));
     };
   } catch(e){}
 
+  // 7. WebSocket 重写
+  //    用 class extends 而非普通函数 return，保证 instanceof WebSocket 检查通过
   try {
     var _WS = window.WebSocket;
-    function ProxyWS(u,p){
-      if(typeof u==='string') u=u.replace(/wss?:\\/\\/[a-z0-9-]+\\.stripchat\\.com/gi,WP+'//'+H);
-      return p!==undefined ? new _WS(u,p) : new _WS(u);
-    }
-    ProxyWS.prototype = _WS.prototype;
-    ProxyWS.CONNECTING=_WS.CONNECTING; ProxyWS.OPEN=_WS.OPEN;
-    ProxyWS.CLOSING=_WS.CLOSING; ProxyWS.CLOSED=_WS.CLOSED;
-    try{ Object.setPrototypeOf(ProxyWS,_WS); }catch(e2){}
+    var ProxyWS = (function(){
+      try {
+        // 现代环境：class 语法，instanceof 原型链正确
+        return new Function('_WS','_rwWS',
+          'return class ProxyWS extends _WS {' +
+          '  constructor(u,p){' +
+          '    if(typeof u==="string") u=_rwWS(u);' +
+          '    if(p!==undefined){ super(u,p); } else { super(u); }' +
+          '  }' +
+          '}'
+        )(_WS, _rwWS);
+      } catch(e2){
+        // 降级：普通构造函数（不支持 class 的旧环境）
+        function FallbackWS(u,p){
+          if(typeof u==='string') u=_rwWS(u);
+          var ws = p!==undefined ? new _WS(u,p) : new _WS(u);
+          return ws;
+        }
+        FallbackWS.prototype = _WS.prototype;
+        Object.setPrototypeOf(FallbackWS, _WS);
+        return FallbackWS;
+      }
+    })();
+    ProxyWS.CONNECTING = _WS.CONNECTING;
+    ProxyWS.OPEN       = _WS.OPEN;
+    ProxyWS.CLOSING    = _WS.CLOSING;
+    ProxyWS.CLOSED     = _WS.CLOSED;
     window.WebSocket = ProxyWS;
   } catch(e){}
 })();
