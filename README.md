@@ -123,9 +123,6 @@
 
 > 每次推送到主分支，Vercel 会自动触发重新部署。
 
-> **⚠️ 关闭 Deployment Protection**：Vercel 默认对预览 URL（`*.vercel.app`）启用 Deployment Protection，访问时会要求登录 Vercel 账号验证身份，导致代理无法正常使用。
-> 请前往项目 **Settings → Deployment Protection**，将保护级别设置为 **Disabled** 或仅对 Production 分支保留保护，否则外部用户无法直接访问预览链接。
-
 #### 方式 B：Vercel CLI 部署
 
 ```bash
@@ -220,7 +217,6 @@ wrangler dev --remote
 | 登录态不稳定                 | Cookie 属性与代理域不兼容        | 检查响应中的 Set-Cookie 重写结果           |
 | 页面脚本报错                 | 上游脚本策略变化或资源重写不完整 | 对比上游原始响应并补齐重写规则             |
 | 访问出现 403/429             | 上游风控或请求特征触发限制       | 降低请求频率，检查请求头与来源策略         |
-| Vercel 预览链接要求登录      | Deployment Protection 未关闭    | 前往项目 Settings → Deployment Protection，将保护级别设为 Disabled |
 
 ---
 
