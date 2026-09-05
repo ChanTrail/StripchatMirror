@@ -1,9 +1,9 @@
 /**
- * Vercel Edge Function 部署入口（functions/proxy.js）
+ * Vercel Edge Function 部署入口（api/proxy.js）
  *
  * 基于 worker.js 逻辑适配，运行在 Vercel Edge Runtime（V8 isolate）。
- * 放在 functions/ 目录而非 api/ 目录，避免 Vercel 将 /api/* 路径识别为
- * 保留路由导致上游 /api/ 请求无法被正确代理。
+ * 通过 vercel.json 的 rewrites 将所有路径路由到此函数，
+ * runtime 通过文件内 export const config 声明，无需在 vercel.json 中指定。
  *
  * 与 Cloudflare Workers 的主要差异：
  *  - 顶部声明 export const config = { runtime: 'edge' }

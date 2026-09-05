@@ -78,7 +78,7 @@
 
 ```text
 .
-├── functions/
+├── api/
 │   └── proxy.js       # Vercel Edge Function 入口
 ├── LICENSE
 ├── README.md
