@@ -20,35 +20,18 @@ const TARGET_DOMAIN = "stripchat.com";
 const TARGET_URL    = `https://${TARGET_DOMAIN}`;
 
 // ─── 需要代理的相关域名 ─────────────────────────────────────────────────────────
-// 用正则匹配所有 *.stripchat.com / *.chantrail.com 子域
-const STRIPCHAT_SUBDOMAIN_RE = /[a-z0-9-]+\.(?:stripchat|chantrail)\.com/gi;
-
-// ─── 外部域名路由表：域名 → 上游 origin ───────────────────────────────────────
-const EXTERNAL_DOMAIN_MAP = {
-	"assets.chapturist.com":    "https://assets.chapturist.com",
-	"assets.strpssts-ana.com":  "https://assets.strpssts-ana.com",
-	"img.strpst.com":           "https://img.strpst.com",
-	"static.stripst.com":       "https://static.stripst.com",
-	"b-eu-ams.stripst.com":     "https://b-eu-ams.stripst.com",
-	"b-eu.stripst.com":         "https://b-eu.stripst.com",
-	"edge-hls.doppiocdn.com":   "https://edge-hls.doppiocdn.com",
-};
+const STRIPCHAT_SUBDOMAIN_RE = /[a-z0-9-]+\.stripchat\.com/gi;
 
 const PROXY_DOMAINS = [
 	"stripchat.com",
 	"www.stripchat.com",
 	"zh.stripchat.com",
-	"assets.chapturist.com",
-	"img.strpst.com",
-	"static.stripst.com",
-	"assets.strpssts-ana.com",
 	"b-eu-ams.stripst.com",
 	"b-eu.stripst.com",
-	"sc1.chantrail.com",
-	"st.chantrail.com",
-	"websocket-sp-v6.st.chantrail.com",
-	"edge-hls.doppiocdn.com",
+	"img.strpst.com",
+	"static.stripst.com",
 	"websocket-sp-v6.stripchat.com",
+	"websocket-sp-v6.st.chantrail.com",
 ];
 
 // ─── Vercel Edge Function 入口 ──────────────────────────────────────────────────
@@ -64,33 +47,12 @@ async function handleRequest(request) {
 		return handleCORS();
 	}
 
-	// ── 忽略 CSP 报告 ────────────────────────────────────────────────────────
 	if (url.pathname === "/_csp" || url.pathname.includes("csp-report")) {
 		return new Response(null, { status: 204 });
 	}
 
-	// ── adblock 检测诱饵：返回空 JS，让前端认为脚本加载成功 ──────────────────
-	if (url.pathname === "/_proxy_noop.js") {
-		return new Response("", {
-			status: 200,
-			headers: {
-				"Content-Type": "application/javascript; charset=utf-8",
-				"Cache-Control": "public, max-age=3600",
-				"Access-Control-Allow-Origin": "*",
-			},
-		});
-	}
-
 	if (url.pathname.startsWith("/cdn-cgi/")) {
 		return proxyChallenge(request, url);
-	}
-
-	// ── 外部域名路由 ──────────────────────────────────────────────────────────
-	const externalTarget = resolveExternalTarget(url, request.headers.get("Referer") || "");
-	if (externalTarget) {
-		const extUrl = new URL(url.pathname + url.search + url.hash, externalTarget);
-		const extResp = await fetch(buildProxyRequest(request, extUrl));
-		return processResponse(extResp, url, request);
 	}
 
 	// WebSocket：Edge Runtime 不支持双向 WS，此处仅做透传尝试
@@ -203,8 +165,7 @@ function buildProxyRequest(originalRequest, targetUrl) {
 
 	[
 		"cf-connecting-ip", "cf-ipcountry", "cf-ray", "cf-visitor",
-		"x-forwarded-for", "x-forwarded-proto", "x-forwarded-host",
-		"x-real-ip", "cf-worker", "cdn-loop",
+		"x-forwarded-for", "x-forwarded-proto", "x-real-ip", "cf-worker", "cdn-loop",
 	].forEach((h) => headers.delete(h));
 
 	const requestInit = {
@@ -249,18 +210,17 @@ async function processResponse(response, proxyUrl, originalRequest) {
 	newHeaders.set("Access-Control-Allow-Headers", "*");
 	newHeaders.set("Access-Control-Expose-Headers", "*");
 
-	// 处理 Set-Cookie：
-	//   - 清除 Domain 限制，避免 cookie 绑定原始域
-	//   - 所有 cookie 统一改为 SameSite=None; Secure
-	//     原因：代理场景下页面与 API 请求均为跨站，SameSite=Lax 会导致
-	//     XHR/fetch 发起的请求不携带 session cookie，服务端认为未登录
 	for (const [key, value] of response.headers.entries()) {
 		if (key.toLowerCase() === "set-cookie") {
 			let c = value.replace(/;\s*Domain=[^;]+/gi, "");
-			// 统一设置 SameSite=None; Secure，保证跨站请求携带 cookie
-			c = c.replace(/;\s*SameSite=[^;]+/gi, "");
-			if (!/;\s*Secure\b/i.test(c)) c += "; Secure";
-			c += "; SameSite=None";
+			const isCfClearance = /^cf_clearance=/i.test(c.trim());
+			if (isCfClearance) {
+				c = c.replace(/;\s*SameSite=[^;]+/gi, "");
+				c += "; SameSite=None; Secure";
+			} else {
+				c = c.replace(/;\s*Secure\b/gi, "").replace(/;\s*SameSite=[^;]+/gi, "");
+				c += "; SameSite=Lax";
+			}
 			if (!c.toLowerCase().includes("path=")) c += "; Path=/";
 			newHeaders.append("Set-Cookie", c);
 		}
@@ -284,10 +244,10 @@ async function processResponse(response, proxyUrl, originalRequest) {
 				text = text.replace(new RegExp(`//${esc}`, "gi"), `//${proxyUrl.host}`);
 			}
 
-			text = text.replace(/https?:\/\/([a-z0-9-]+\.(?:stripchat|chantrail|chapturist)\.com)/gi, proxyUrl.origin);
-			text = text.replace(/\/\/([a-z0-9-]+\.(?:stripchat|chantrail|chapturist)\.com)/gi, `//${proxyUrl.host}`);
+			text = text.replace(/https?:\/\/([a-z0-9-]+\.stripchat\.com)/gi, proxyUrl.origin);
+			text = text.replace(/\/\/([a-z0-9-]+\.stripchat\.com)/gi, `//${proxyUrl.host}`);
 
-			text = text.replace(/wss?:\/\/([a-z0-9-]+\.(?:stripchat|chantrail|chapturist)\.com)/gi, () => {
+			text = text.replace(/wss?:\/\/([a-z0-9-]+\.stripchat\.com)/gi, () => {
 				const wsProto = proxyUrl.protocol === "https:" ? "wss:" : "ws:";
 				return `${wsProto}//${proxyUrl.host}`;
 			});
@@ -303,13 +263,13 @@ async function processResponse(response, proxyUrl, originalRequest) {
 
 			if (contentType.includes("text/html")) {
 				text = text.replace(/<meta[^>]*http-equiv=["']Content-Security-Policy["'][^>]*>/gi, "");
-
-				// 不屏蔽 cloudflareinsights / beacon 脚本（adblock 检测诱饵），改为重定向到 noop
+				text = text.replace(/<script[^>]*cloudflareinsights\.com[^>]*>[\s\S]*?<\/script>/gi, "<!-- CF blocked -->");
+				text = text.replace(/<script[^>]*cloudflareinsights\.com[^>]*\/>/gi, "<!-- CF blocked -->");
 				text = text.replace(
-					/(src=)(["'])https?:\/\/[^"']*cloudflareinsights\.com[^"']*(["'])/gi,
-					"$1$2/_proxy_noop.js$3",
+					/<script([^>]*)src=(["'])[^"']*cloudflareinsights\.com[^"']*\2([^>]*)>[\s\S]*?<\/script>/gi,
+					"<!-- CF blocked -->",
 				);
-
+				text = text.replace(/<script[^>]*beacon\.min\.js[^>]*>[\s\S]*?<\/script>/gi, "<!-- Beacon blocked -->");
 				text = text.replace(/<script([^>]*)\s+integrity=(["'])[^"']*\2([^>]*)>/gi, "<script$1$3>");
 				text = text.replace(/<script([^>]*)\s+crossorigin=(["'])[^"']*\2([^>]*)>/gi, "<script$1$3>");
 				text = text.replace(/<link([^>]*)\s+integrity=(["'])[^"']*\2([^>]*)>/gi, "<link$1$3>");
@@ -346,15 +306,8 @@ function buildProxyScript(proxyUrl) {
   var O = ${JSON.stringify(origin)};
   var H = ${JSON.stringify(host)};
   var WP = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  var blockedDomains = ['googletagmanager.com'];
-  var noopDomains = ['cloudflareinsights.com','beacon.min.js'];
+  var blockedDomains = ['cloudflareinsights.com','googletagmanager.com','beacon.min.js'];
 
-  // 0. 伪造 __cf_chl_opt，防止前端检测"未通过 CF Bot 挑战"后渲染错误页
-  try { if(!window.__cf_chl_opt) window.__cf_chl_opt = {}; } catch(e){}
-
-  // 1. Cookie 修复
-  //    - 去除 Domain 绑定，使 cookie 在代理域下生效
-  //    - 保留 SameSite=None（跨站 API 请求必须携带），不再错误地将其删除
   try {
     var desc = Object.getOwnPropertyDescriptor(Document.prototype,'cookie') ||
                Object.getOwnPropertyDescriptor(HTMLDocument.prototype,'cookie');
@@ -363,9 +316,8 @@ function buildProxyScript(proxyUrl) {
         get: function(){ return desc.get.call(document); },
         set: function(v){
           v = v.replace(/;\\s*[Dd]omain=[^;]+/g,'');
-          // HTTP 环境下去掉 Secure 标志，避免 cookie 无法写入
-          if(location.protocol!=='https:') v=v.replace(/;\\s*[Ss]ecure\\b/g,'');
-          // 不再删除 SameSite=None，跨站 fetch/XHR 需要它来携带 cookie
+          if(location.protocol!=='https:') v=v.replace(/;\\s*[Ss]ecure/g,'');
+          v = v.replace(/;\\s*[Ss]ameSite=None/g,'');
           return desc.set.call(document,v);
         },
         configurable:true
@@ -373,49 +325,25 @@ function buildProxyScript(proxyUrl) {
     }
   } catch(e){}
 
-  // 2. 脚本注入拦截（appendChild / insertBefore / prepend / after）
   try {
     var _ac = Element.prototype.appendChild;
     var _ib = Element.prototype.insertBefore;
-    var _pr = Element.prototype.prepend;
-    var _af = Element.prototype.after;
     function chk(el){
       if(el && el.tagName==='SCRIPT'){
         var s=el.src||el.getAttribute('src')||'';
         if(blockedDomains.some(function(d){return s.indexOf(d)>=0;})) return true;
-        if(noopDomains.some(function(d){return s.indexOf(d)>=0;})){
-          el.src = '/_proxy_noop.js';
-          el.removeAttribute('integrity');
-          el.removeAttribute('crossorigin');
-          return false;
-        }
         el.removeAttribute('integrity');
         el.removeAttribute('crossorigin');
       }
       return false;
     }
-    Element.prototype.appendChild  = function(el){ return chk(el)?el:_ac.call(this,el); };
-    Element.prototype.insertBefore = function(n,r){ return chk(n)?n:_ib.call(this,n,r); };
-    if(_pr) Element.prototype.prepend = function(){ var a=Array.prototype.slice.call(arguments); a.forEach(function(n){ chk(n); }); return _pr.apply(this,a); };
-    if(_af) Element.prototype.after  = function(){ var a=Array.prototype.slice.call(arguments); a.forEach(function(n){ chk(n); }); return _af.apply(this,a); };
+    Element.prototype.appendChild=function(el){ return chk(el)?el:_ac.call(this,el); };
+    Element.prototype.insertBefore=function(n,r){ return chk(n)?n:_ib.call(this,n,r); };
   } catch(e){}
 
-  // 3. URL 重写工具函数
-  //    覆盖所有需要代理的域：*.stripchat.com、*.stripst.com、*.chantrail.com、*.strpst.com、*.chapturist.com
-  var PROXY_RE = /https?:\\/\\/(?:[a-z0-9-]+\\.)?(?:stripchat\\.com|stripst\\.com|chantrail\\.com|strpst\\.com|chapturist\\.com)/gi;
-  var WS_RE    = /wss?:\\/\\/(?:[a-z0-9-]+\\.)?(?:stripchat\\.com|stripst\\.com|chantrail\\.com|strpst\\.com|chapturist\\.com)/gi;
-  function _rw(u){
-    if(typeof u!=='string') return u;
-    return u.replace(PROXY_RE, O);
-  }
-  function _rwWS(u){
-    if(typeof u!=='string') return u;
-    return u.replace(WS_RE, WP+'//'+H);
-  }
-
-  // 4. fetch 重写
   try {
     var _f = window.fetch;
+    function _rw(u){ return typeof u==='string'?u.replace(/https?:\\/\\/[a-z0-9-]+\\.stripchat\\.com/gi,O):u; }
     window.fetch = function(input, init) {
       if(typeof input==='string'){
         input = _rw(input);
@@ -428,54 +356,24 @@ function buildProxyScript(proxyUrl) {
     };
   } catch(e){}
 
-  // 5. sendBeacon 重写（统计上报跨域）
-  try {
-    var _sb = navigator.sendBeacon.bind(navigator);
-    navigator.sendBeacon = function(url, data){
-      return _sb(_rw(url), data);
-    };
-  } catch(e){}
-
-  // 6. XHR 重写
   try {
     var _o = XMLHttpRequest.prototype.open;
     XMLHttpRequest.prototype.open = function(m,u){
-      if(typeof u==='string') u=_rw(u);
+      if(typeof u==='string') u=u.replace(/https?:\\/\\/[a-z0-9-]+\\.stripchat\\.com/gi,O);
       return _o.apply(this,[m,u].concat(Array.prototype.slice.call(arguments,2)));
     };
   } catch(e){}
 
-  // 7. WebSocket 重写
-  //    用 class extends 而非普通函数 return，保证 instanceof WebSocket 检查通过
   try {
     var _WS = window.WebSocket;
-    var ProxyWS = (function(){
-      try {
-        // 现代环境：class 语法，instanceof 原型链正确
-        return new Function('_WS','_rwWS',
-          'return class ProxyWS extends _WS {' +
-          '  constructor(u,p){' +
-          '    if(typeof u==="string") u=_rwWS(u);' +
-          '    if(p!==undefined){ super(u,p); } else { super(u); }' +
-          '  }' +
-          '}'
-        )(_WS, _rwWS);
-      } catch(e2){
-        // 降级：普通构造函数（不支持 class 的旧环境）
-        function FallbackWS(u,p){
-          if(typeof u==='string') u=_rwWS(u);
-          var ws = p!==undefined ? new _WS(u,p) : new _WS(u);
-          return ws;
-        }
-        FallbackWS.prototype = _WS.prototype;
-        Object.setPrototypeOf(FallbackWS, _WS);
-        return FallbackWS;
-      }
-    })();
-    ProxyWS.CONNECTING = _WS.CONNECTING;
-    ProxyWS.OPEN       = _WS.OPEN;
-    ProxyWS.CLOSING    = _WS.CLOSING;
-    ProxyWS.CLOSED     = _WS.CLOSED;
+    function ProxyWS(u,p){
+      if(typeof u==='string') u=u.replace(/wss?:\\/\\/[a-z0-9-]+\\.stripchat\\.com/gi,WP+'//'+H);
+      return p!==undefined ? new _WS(u,p) : new _WS(u);
+    }
+    ProxyWS.prototype = _WS.prototype;
+    ProxyWS.CONNECTING=_WS.CONNECTING; ProxyWS.OPEN=_WS.OPEN;
+    ProxyWS.CLOSING=_WS.CLOSING; ProxyWS.CLOSED=_WS.CLOSED;
+    try{ Object.setPrototypeOf(ProxyWS,_WS); }catch(e2){}
     window.WebSocket = ProxyWS;
   } catch(e){}
 })();
@@ -494,16 +392,4 @@ function handleCORS() {
 			"Access-Control-Max-Age": "86400",
 		},
 	});
-}
-
-// ─── 外部域名路由解析 ───────────────────────────────────────────────────────────
-function resolveExternalTarget(url, referer) {
-	const p = url.pathname;
-	if (p.startsWith("/assets/")) {
-		return "https://assets.chapturist.com";
-	}
-	if (p.startsWith("/hls/") || p.startsWith("/edge-hls/")) {
-		return "https://edge-hls.doppiocdn.com";
-	}
-	return null;
 }

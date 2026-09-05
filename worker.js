@@ -14,43 +14,19 @@ const TARGET_DOMAIN = "stripchat.com";
 const TARGET_URL    = `https://${TARGET_DOMAIN}`;
 
 // ─── 需要代理的相关域名 ─────────────────────────────────────────────────────────
-// 用正则匹配所有 *.stripchat.com / *.chantrail.com 子域
-const STRIPCHAT_SUBDOMAIN_RE = /[a-z0-9-]+\.(?:stripchat|chantrail)\.com/gi;
-
-// ─── 外部域名路由表：域名 → 上游 origin ───────────────────────────────────────
-// 浏览器请求代理域名时，根据 Referer / 已知路径前缀把请求转发到对应上游
-const EXTERNAL_DOMAIN_MAP = {
-	"assets.chapturist.com":    "https://assets.chapturist.com",
-	"assets.strpssts-ana.com":  "https://assets.strpssts-ana.com",
-	"img.strpst.com":           "https://img.strpst.com",
-	"static.stripst.com":       "https://static.stripst.com",
-	"b-eu-ams.stripst.com":     "https://b-eu-ams.stripst.com",
-	"b-eu.stripst.com":         "https://b-eu.stripst.com",
-	"edge-hls.doppiocdn.com":   "https://edge-hls.doppiocdn.com",
-};
+// 用正则匹配所有 *.stripchat.com 子域，同时保留固定的 CDN 域名
+const STRIPCHAT_SUBDOMAIN_RE = /[a-z0-9-]+\.stripchat\.com/gi;
 
 const PROXY_DOMAINS = [
-	// ── stripchat.com 主域及子域 ──────────────────────────────────
 	"stripchat.com",
 	"www.stripchat.com",
 	"zh.stripchat.com",
-	// ── chapturist.com（所有静态资源/JS bundle）────────────────────
-	"assets.chapturist.com",
-	// ── stripchat 其他静态/CDN 域 ─────────────────────────────────
-	"img.strpst.com",
-	"static.stripst.com",
-	"assets.strpssts-ana.com",
-	// ── stripst.com CDN ───────────────────────────────────────────
 	"b-eu-ams.stripst.com",
 	"b-eu.stripst.com",
-	// ── chantrail.com（CF 代理域，含 RUM / WS / CDN）─────────────
-	"sc1.chantrail.com",
-	"st.chantrail.com",
-	"websocket-sp-v6.st.chantrail.com",
-	// ── HLS 流媒体 ─────────────────────────────────────────────────
-	"edge-hls.doppiocdn.com",
-	// ── WebSocket ────────────────────────────────────────────────
+	"img.strpst.com",
+	"static.stripst.com",
 	"websocket-sp-v6.stripchat.com",
+	"websocket-sp-v6.st.chantrail.com",
 ];
 
 // ─── Worker 入口（ES Module 模式）───────────────────────────────────────────────
@@ -72,32 +48,6 @@ async function handleRequest(request) {
 	// ── 忽略 CSP 报告 ────────────────────────────────────────────────────────
 	if (url.pathname === "/_csp" || url.pathname.includes("csp-report")) {
 		return new Response(null, { status: 204 });
-	}
-
-	// ── adblock 检测诱饵：返回空 JS，让前端认为脚本加载成功 ──────────────────
-	// stripchat 通过检测 cloudflareinsights 等脚本能否加载来判断是否被广告拦截，
-	// 如果脚本被屏蔽则渲染 "Something's Not Loading Right" 错误页。
-	// 代理把这类脚本的 src 重定向到 /_proxy_noop.js，返回合法的空 JS 响应。
-	if (url.pathname === "/_proxy_noop.js") {
-		return new Response("", {
-			status: 200,
-			headers: {
-				"Content-Type": "application/javascript; charset=utf-8",
-				"Cache-Control": "public, max-age=3600",
-				"Access-Control-Allow-Origin": "*",
-			},
-		});
-	}
-
-	// ── 外部域名路由：根据 Referer 判断请求归属哪个上游域名 ─────────────────
-	// 场景：HTML 里 assets.chapturist.com 的 URL 已被替换成代理域名，
-	// 浏览器请求 /assets/bootstrap.xxx.js 时 Referer 是代理域名，
-	// 需要根据路径前缀推断真正的上游并转发。
-	const externalTarget = resolveExternalTarget(url, request.headers.get("Referer") || "");
-	if (externalTarget) {
-		const extUrl = new URL(url.pathname + url.search + url.hash, externalTarget);
-		const extResp = await fetch(buildProxyRequest(request, extUrl));
-		return processResponse(extResp, url, request);
 	}
 
 	// ── /cdn-cgi/ 路由：CF Bot 挑战回调透传 ──────────────────────────────────
@@ -222,10 +172,9 @@ function buildProxyRequest(originalRequest, targetUrl) {
 	// 覆盖 CF IP 地理位置判断，防止服务端按 IP 跳转到中文子域
 	headers.set("CF-IPCountry", "US");
 
-	// 删除所有 Cloudflare 注入头及反向代理特征头，避免暴露代理身份
+	// 删除所有 Cloudflare 注入头，避免暴露代理身份
 	["cf-connecting-ip","cf-ipcountry","cf-ray","cf-visitor",
-	 "x-forwarded-for","x-forwarded-proto","x-forwarded-host",
-	 "x-real-ip","cf-worker","cdn-loop"]
+	 "x-forwarded-for","x-forwarded-proto","x-real-ip","cf-worker","cdn-loop"]
 		.forEach(h => headers.delete(h));
 
 	const requestInit = {
@@ -270,18 +219,21 @@ async function processResponse(response, proxyUrl, originalRequest) {
 	newHeaders.set("Access-Control-Allow-Headers", "*");
 	newHeaders.set("Access-Control-Expose-Headers", "*");
 
-	// 处理 Set-Cookie：
-	//   - 清除 Domain 限制，避免 cookie 绑定原始域
-	//   - 所有 cookie 统一改为 SameSite=None; Secure
-	//     原因：代理场景下页面与 API 请求均为跨站，SameSite=Lax 会导致
-	//     XHR/fetch 发起的请求不携带 session cookie，服务端认为未登录
+	// 处理 Set-Cookie（清除 Domain；cf_clearance 等保留 Secure+SameSite=None）
 	for (const [key, value] of response.headers.entries()) {
 		if (key.toLowerCase() === "set-cookie") {
 			let c = value.replace(/;\s*Domain=[^;]+/gi, "");
-			// 统一设置 SameSite=None; Secure，保证跨站请求携带 cookie
-			c = c.replace(/;\s*SameSite=[^;]+/gi, "");
-			if (!/;\s*Secure\b/i.test(c)) c += "; Secure";
-			c += "; SameSite=None";
+			const isCfClearance = /^cf_clearance=/i.test(c.trim());
+			if (isCfClearance) {
+				// cf_clearance 必须 SameSite=None + Secure，否则跨站携带失败
+				c = c.replace(/;\s*SameSite=[^;]+/gi, "");
+				c += "; SameSite=None; Secure";
+			} else {
+				// 其他 cookie 去掉 Secure，改为 SameSite=Lax，方便 HTTP 测试
+				c = c.replace(/;\s*Secure\b/gi, "")
+				     .replace(/;\s*SameSite=[^;]+/gi, "");
+				c += "; SameSite=Lax";
+			}
 			if (!c.toLowerCase().includes("path=")) c += "; Path=/";
 			newHeaders.append("Set-Cookie", c);
 		}
@@ -306,18 +258,18 @@ async function processResponse(response, proxyUrl, originalRequest) {
 				text = text.replace(new RegExp(`//${esc}`, "gi"), `//${proxyUrl.host}`);
 			}
 
-			// URL 重写：*.stripchat.com / *.chantrail.com / *.chapturist.com 所有子域
+			// URL 重写：*.stripchat.com 所有子域（捕获挑战脚本里硬编码的 zh.stripchat.com 等）
 			text = text.replace(
-				/https?:\/\/([a-z0-9-]+\.(?:stripchat|chantrail|chapturist)\.com)/gi,
+				/https?:\/\/([a-z0-9-]+\.stripchat\.com)/gi,
 				proxyUrl.origin,
 			);
 			text = text.replace(
-				/\/\/([a-z0-9-]+\.(?:stripchat|chantrail|chapturist)\.com)/gi,
+				/\/\/([a-z0-9-]+\.stripchat\.com)/gi,
 				`//${proxyUrl.host}`,
 			);
 
-			// WebSocket URL 重写（所有相关子域）
-			text = text.replace(/wss?:\/\/([a-z0-9-]+\.(?:stripchat|chantrail|chapturist)\.com)/gi, () => {
+			// WebSocket URL 重写（所有 *.stripchat.com 子域）
+			text = text.replace(/wss?:\/\/([a-z0-9-]+\.stripchat\.com)/gi, (match) => {
 				const wsProto = proxyUrl.protocol === "https:" ? "wss:" : "ws:";
 				return `${wsProto}//${proxyUrl.host}`;
 			});
@@ -336,15 +288,11 @@ async function processResponse(response, proxyUrl, originalRequest) {
 				// 移除 CSP meta 标签
 				text = text.replace(/<meta[^>]*http-equiv=["']Content-Security-Policy["'][^>]*>/gi, "");
 
-				// 不屏蔽 cloudflareinsights / beacon 脚本：
-				// stripchat 使用这类脚本作为广告拦截检测的"诱饵"——
-				// 如果脚本被屏蔽，前端会渲染 "Something's Not Loading Right" 错误页。
-				// 正确做法是让脚本请求打到代理域名下，由 /cdn-cgi/bm/* 路由或直接返回空响应。
-				// 只替换 src 里的外部域名，让请求走代理路径。
-				text = text.replace(
-					/(src=)(["'])https?:\/\/[^"']*cloudflareinsights\.com[^"']*(["'])/gi,
-					"$1$2/_proxy_noop.js$3",
-				);
+				// 屏蔽 Cloudflare Insights / beacon
+				text = text.replace(/<script[^>]*cloudflareinsights\.com[^>]*>[\s\S]*?<\/script>/gi, "<!-- CF blocked -->");
+				text = text.replace(/<script[^>]*cloudflareinsights\.com[^>]*\/>/gi, "<!-- CF blocked -->");
+				text = text.replace(/<script([^>]*)src=(["'])[^"']*cloudflareinsights\.com[^"']*\2([^>]*)>[\s\S]*?<\/script>/gi, "<!-- CF blocked -->");
+				text = text.replace(/<script[^>]*beacon\.min\.js[^>]*>[\s\S]*?<\/script>/gi, "<!-- Beacon blocked -->");
 
 				// 移除 integrity / crossorigin 属性
 				text = text.replace(/<script([^>]*)\s+integrity=(["'])[^"']*\2([^>]*)>/gi, "<script$1$3>");
@@ -384,17 +332,9 @@ function buildProxyScript(proxyUrl) {
   var O = ${JSON.stringify(origin)};
   var H = ${JSON.stringify(host)};
   var WP = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  var blockedDomains = ['googletagmanager.com'];
-  // cloudflareinsights / beacon 不再屏蔽，改为重定向到空响应，
-  // 防止 stripchat adblock 检测误判触发错误页
-  var noopDomains = ['cloudflareinsights.com','beacon.min.js'];
-
-  // 0. 伪造 __cf_chl_opt，防止前端检测"未通过 CF Bot 挑战"后渲染错误页
-  try { if(!window.__cf_chl_opt) window.__cf_chl_opt = {}; } catch(e){}
+  var blockedDomains = ['cloudflareinsights.com','googletagmanager.com','beacon.min.js'];
 
   // 1. Cookie 修复
-  //    - 去除 Domain 绑定，使 cookie 在代理域下生效
-  //    - 保留 SameSite=None（跨站 API 请求必须携带），不再错误地将其删除
   try {
     var desc = Object.getOwnPropertyDescriptor(Document.prototype,'cookie') ||
                Object.getOwnPropertyDescriptor(HTMLDocument.prototype,'cookie');
@@ -403,9 +343,8 @@ function buildProxyScript(proxyUrl) {
         get: function(){ return desc.get.call(document); },
         set: function(v){
           v = v.replace(/;\\s*[Dd]omain=[^;]+/g,'');
-          // HTTP 环境下去掉 Secure 标志，避免 cookie 无法写入
-          if(location.protocol!=='https:') v=v.replace(/;\\s*[Ss]ecure\\b/g,'');
-          // 不再删除 SameSite=None，跨站 fetch/XHR 需要它来携带 cookie
+          if(location.protocol!=='https:') v=v.replace(/;\\s*[Ss]ecure/g,'');
+          v = v.replace(/;\\s*[Ss]ameSite=None/g,'');
           return desc.set.call(document,v);
         },
         configurable:true
@@ -413,50 +352,27 @@ function buildProxyScript(proxyUrl) {
     }
   } catch(e){}
 
-  // 2. 脚本注入拦截（appendChild / insertBefore / prepend / after）
+  // 2. 脚本注入拦截
   try {
     var _ac = Element.prototype.appendChild;
     var _ib = Element.prototype.insertBefore;
-    var _pr = Element.prototype.prepend;
-    var _af = Element.prototype.after;
     function chk(el){
       if(el && el.tagName==='SCRIPT'){
         var s=el.src||el.getAttribute('src')||'';
         if(blockedDomains.some(function(d){return s.indexOf(d)>=0;})) return true;
-        // cloudflareinsights 等诱饵脚本重定向到空 noop，让检测通过
-        if(noopDomains.some(function(d){return s.indexOf(d)>=0;})){
-          el.src = '/_proxy_noop.js';
-          el.removeAttribute('integrity');
-          el.removeAttribute('crossorigin');
-          return false; // 不拦截，让它加载 noop
-        }
         el.removeAttribute('integrity');
         el.removeAttribute('crossorigin');
       }
       return false;
     }
-    Element.prototype.appendChild  = function(el){ return chk(el)?el:_ac.call(this,el); };
-    Element.prototype.insertBefore = function(n,r){ return chk(n)?n:_ib.call(this,n,r); };
-    if(_pr) Element.prototype.prepend = function(){ var a=Array.prototype.slice.call(arguments); a.forEach(function(n){ chk(n); }); return _pr.apply(this,a); };
-    if(_af) Element.prototype.after  = function(){ var a=Array.prototype.slice.call(arguments); a.forEach(function(n){ chk(n); }); return _af.apply(this,a); };
+    Element.prototype.appendChild=function(el){ return chk(el)?el:_ac.call(this,el); };
+    Element.prototype.insertBefore=function(n,r){ return chk(n)?n:_ib.call(this,n,r); };
   } catch(e){}
 
-  // 3. URL 重写工具函数
-  //    覆盖所有需要代理的域：*.stripchat.com、*.stripst.com、*.chantrail.com、*.strpst.com、*.chapturist.com
-  var PROXY_RE = /https?:\\/\\/(?:[a-z0-9-]+\\.)?(?:stripchat\\.com|stripst\\.com|chantrail\\.com|strpst\\.com|chapturist\\.com)/gi;
-  var WS_RE    = /wss?:\\/\\/(?:[a-z0-9-]+\\.)?(?:stripchat\\.com|stripst\\.com|chantrail\\.com|strpst\\.com|chapturist\\.com)/gi;
-  function _rw(u){
-    if(typeof u!=='string') return u;
-    return u.replace(PROXY_RE, O);
-  }
-  function _rwWS(u){
-    if(typeof u!=='string') return u;
-    return u.replace(WS_RE, WP+'//'+H);
-  }
-
-  // 4. fetch 重写
+  // 3. fetch 重写（含 /cdn-cgi/ 挑战回调）
   try {
     var _f = window.fetch;
+    function _rw(u){ return typeof u==='string'?u.replace(/https?:\\/\\/[a-z0-9-]+\\.stripchat\\.com/gi,O):u; }
     window.fetch = function(input, init) {
       if(typeof input==='string'){
         input = _rw(input);
@@ -469,78 +385,30 @@ function buildProxyScript(proxyUrl) {
     };
   } catch(e){}
 
-  // 5. sendBeacon 重写（统计上报跨域）
-  try {
-    var _sb = navigator.sendBeacon.bind(navigator);
-    navigator.sendBeacon = function(url, data){
-      return _sb(_rw(url), data);
-    };
-  } catch(e){}
-
-  // 6. XHR 重写
+  // 4. XHR 重写
   try {
     var _o = XMLHttpRequest.prototype.open;
     XMLHttpRequest.prototype.open = function(m,u){
-      if(typeof u==='string') u=_rw(u);
+      if(typeof u==='string') u=u.replace(/https?:\\/\\/[a-z0-9-]+\\.stripchat\\.com/gi,O);
       return _o.apply(this,[m,u].concat(Array.prototype.slice.call(arguments,2)));
     };
   } catch(e){}
 
-  // 7. WebSocket 重写
-  //    用 class extends 而非普通函数 return，保证 instanceof WebSocket 检查通过
+  // 5. WebSocket 重写（正确继承原型，保证 instanceof 检查通过）
   try {
     var _WS = window.WebSocket;
-    var ProxyWS = (function(){
-      try {
-        // 现代环境：class 语法，instanceof 原型链正确
-        return new Function('_WS','_rwWS',
-          'return class ProxyWS extends _WS {' +
-          '  constructor(u,p){' +
-          '    if(typeof u==="string") u=_rwWS(u);' +
-          '    if(p!==undefined){ super(u,p); } else { super(u); }' +
-          '  }' +
-          '}'
-        )(_WS, _rwWS);
-      } catch(e2){
-        // 降级：普通构造函数（不支持 class 的旧环境）
-        function FallbackWS(u,p){
-          if(typeof u==='string') u=_rwWS(u);
-          var ws = p!==undefined ? new _WS(u,p) : new _WS(u);
-          return ws;
-        }
-        FallbackWS.prototype = _WS.prototype;
-        Object.setPrototypeOf(FallbackWS, _WS);
-        return FallbackWS;
-      }
-    })();
-    ProxyWS.CONNECTING = _WS.CONNECTING;
-    ProxyWS.OPEN       = _WS.OPEN;
-    ProxyWS.CLOSING    = _WS.CLOSING;
-    ProxyWS.CLOSED     = _WS.CLOSED;
+    function ProxyWS(u,p){
+      if(typeof u==='string') u=u.replace(/wss?:\\/\\/[a-z0-9-]+\\.stripchat\\.com/gi,WP+'//'+H);
+      return p!==undefined ? new _WS(u,p) : new _WS(u);
+    }
+    ProxyWS.prototype = _WS.prototype;
+    ProxyWS.CONNECTING=_WS.CONNECTING; ProxyWS.OPEN=_WS.OPEN;
+    ProxyWS.CLOSING=_WS.CLOSING; ProxyWS.CLOSED=_WS.CLOSED;
+    try{ Object.setPrototypeOf(ProxyWS,_WS); }catch(e2){}
     window.WebSocket = ProxyWS;
   } catch(e){}
 })();
 </script>`;
-}
-
-// ─── 外部域名路由解析 ───────────────────────────────────────────────────────────
-// 判断当前请求是否应该转发到非 stripchat.com 的上游域名。
-// 策略：
-//  1. 路径以 /assets/ 开头 → chapturist.com（JS bundle / CSS / 图片）
-//  2. 路径以 /pixel/ 开头 → stripchat.com（adblock 像素上报，保持默认）
-//  3. 路径以 /hls/ 开头   → edge-hls.doppiocdn.com（HLS 流）
-// 返回完整 origin 字符串，或 null（走默认 stripchat.com 路由）
-function resolveExternalTarget(url, referer) {
-	const p = url.pathname;
-	// JS / CSS / 字体 / 图片等静态资源
-	if (p.startsWith("/assets/")) {
-		return "https://assets.chapturist.com";
-	}
-	// HLS 流媒体分片
-	if (p.startsWith("/hls/") || p.startsWith("/edge-hls/")) {
-		return "https://edge-hls.doppiocdn.com";
-	}
-	return null;
 }
 
 // ─── CORS 预检 ──────────────────────────────────────────────────────────────────
